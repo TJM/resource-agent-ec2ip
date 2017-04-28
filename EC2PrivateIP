@@ -1,0 +1,254 @@
+#!/bin/bash
+#
+# Resouce Agent for managing EC2PrivateIP Resources
+#
+# Description:	Assign an EC2 Private IP
+#
+# Author:	Tommy McNeely <tommy@lark-it.com>
+# License:      GNU General Public License (GPL)
+# Support:      tommy@lark-it.com
+# Copyright:	(c) 2017 Tommy
+#
+#	This script manages the assignment of an Amazon Web
+#       Services (AWS) Private IP. It attaches an IP of your
+#       choice to the primary NIC of this instance.
+#
+#	It can add an IP alias, or remove one.
+#
+#	usage: $0 <ip-address> {start|stop|status|monitor}
+#
+#	The "start" arg adds an IP alias.
+#
+#	Surprisingly, the "stop" arg removes one.	:-)
+#
+# Setup:
+#
+# You need, at a minimum, the following permissions:
+# {
+#  "Statement": [
+#    {
+#      "Action": [
+#        "ec2:AssignPrivateIpAddresses",
+#        "ec2:UnassignPrivateIpAddresses",
+#        "ec2:DescribeInstances"
+#      ],
+#      "Effect": "Allow",
+#      "Resource": "*"
+#    }
+#  ]
+# }
+#
+
+### START CONFIGURATION
+REGION='us-east-1'
+AWSCLI='/opt/awscli/bin/aws'
+DONT_STOP=true # Stopping disassociates the EIP
+
+# Set Proxy (if we are not the proxy server)
+if $(hostname | grep -qv proxy ); then # Use Proxy
+  source /usr/local/etc/proxy.sh
+  export no_proxy=169.254.169.254
+fi
+
+### END CONFIGURATION
+
+# Map cluster functions
+. /etc/ha.d/resource.d/hto-mapfuncs
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+. ${OCF_FUNCTIONS_DIR}/findif.sh
+
+# http://www.davidpashley.com/articles/writing-robust-shell-scripts/
+#set -o errexit
+#set -o nounset
+# The above two lines caused issues with ocf_log (at least I think they did)
+
+# Set INSTANCE_ID (global) using meta-data from provider.
+get_instance_id() {
+  INSTANCE_ID=$(curl --silent http://169.254.169.254/latest/meta-data/instance-id)
+}
+
+
+# Return first ENI (elastic network interface) ID
+# TODO: Make this handle multiple interfaces?
+get_eni() {
+  [[ -z $INSTANCE_ID ]] && get_instance_id
+  ENI=$($AWSCLI ec2 describe-instances \
+    --region $REGION \
+    --instance-ids $INSTANCE_ID | \
+    jq -r \
+    '.Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' )
+}
+
+
+ec2privateip_validate_all() {
+  ## VALIDATE NOT IMPLEMENTED
+  # TODO:
+  # - Check AWS binary
+  check_binary $AWSCLI
+  # - Check IP
+  # - Maybe even ping the AWS CLI to see if we have access?
+  return $OCF_SUCCESS
+}  
+
+ec2privateip_start() {
+  # exit immediately if configuration is not valid
+  ec2privateip_validate_all || exit $?
+
+  # Check it
+  if ec2privateip_monitor; then
+    ocf_log info "Resource: ${OCF_RESOURCE_INSTANCE} is already running!"
+    return $OCF_SUCCESS
+  fi
+
+  get_eni
+  ocf_log info "Resouce: ${OCF_RESOURCE_INSTANCE} - Adding IP $IP to ENI $ENI"
+  ocf_run $AWSCLI ec2 assign-private-ip-addresses \
+    --region $REGION \
+    --network-interface-id $ENI \
+    --private-ip-addresses $IP \
+    --allow-reassignment
+
+  ec2privateip_monitor
+  rc=$?
+  case "$rc" in
+    "$OCF_SUCCESS")
+      # Currently running. Normal, expected behavior.
+      ocf_log info "Resource: ${OCF_RESOURCE_INSTANCE} is started."
+      return $OCF_SUCCESS
+      ;;
+    "$OCF_NOT_RUNNING")
+      # Currently not running. BAD!
+      ocf_log info "Resource: ${OCF_RESOURCE_INSTANCE} FAILED to start."
+      return $OCF_NOT_RUNNING
+      ;;
+  esac
+}
+
+
+ec2privateip_stop() {
+  # exit immediately if configuration is not valid
+  ec2privateip_validate_all || exit $?
+
+  ec2privateip_monitor
+  rc=$?
+  case "$rc" in
+    "$OCF_SUCCESS")
+      # Currently running. Normal, expected behavior.
+      ocf_log debug "Resource: ${OCF_RESOURCE_INSTANCE} is currently running"
+      ;;
+    "$OCF_NOT_RUNNING")
+      # Currently not running. Nothing to do.
+      ocf_log info "Resource: ${OCF_RESOURCE_INSTANCE} is already stopped"
+      return $OCF_SUCCESS
+      ;;
+  esac
+
+  # Stopping an interface seems to disassociate the EIP
+  if [ $DONT_STOP ]; then
+    ocf_log info "Resource: ${OCF_RESOURCE_INSTANCE} is not actually stopping (DONT_STOP)"
+    exit $OCF_SUCCESS
+  fi
+
+  get_eni
+  #echo "Removing IP $IP from ENI $ENI"
+  ocf_run $AWSCLI ec2 unassign-private-ip-addresses \
+    --region $REGION \
+    --network-interface-id $ENI \
+    --private-ip-addresses $IP
+  rc=$?
+  if [ $rc ]; then
+    if ec2privateip_monitor; then
+      ocf_log error "Resource: ${OCF_RESOURCE_INSTANCE} not stopped, AIeeeee!"
+      exit $OCF_ERR_GENERIC
+    fi
+  else
+    ocf_log error "Resource: ${OCF_RESOURCE_INSTANCE} - AWS CLI Command Failed."
+    exit $OCF_ERR_GENERIC
+  fi
+
+  # If we get here, assume we have "stopped" correctly
+  return $OCF_SUCCESS
+}
+
+
+ec2privateip_monitor() {
+  local rc
+
+  [[ -z $INSTANCE_ID ]] && get_instance_id
+
+  $AWSCLI ec2 describe-instances \
+    --region $REGION \
+    --instance-ids $INSTANCE_ID | \
+    jq -r \
+  '.Reservations[0].Instances[0].NetworkInterfaces[].PrivateIpAddresses[].PrivateIpAddress' | grep -q $IP
+  #'.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[1].PrivateIpAddress' | grep -q $IP
+  case "$?" in
+    0)
+      rc=$OCF_SUCCESS
+      ocf_log debug "Resource is running"
+      ;;
+    1)
+      rc=$OCF_NOT_RUNNING
+      ocf_log debug "Resource is stopped."
+      ;;
+    *)
+      ocf_log err "Resource has failed"
+      exit $OCF_ERR_GENERIC
+      ;;
+  esac
+
+  return $rc
+}
+
+
+ec2privateip_status() {
+  # exit immediately if configuration is not valid
+  ec2privateip_validate_all || exit $?
+
+  if ec2privateip_monitor; then
+    echo "running"
+    return $OCF_SUCCESS
+  else
+    echo "stopped"
+    return $OCF_NOT_RUNNING
+  fi
+}
+
+
+# Usage
+usage() {
+    echo "usage: $0 <ip-address> $LEGAL_ACTIONS"
+    exit 1
+}
+
+if [ $# != 2 ]; then
+    usage
+fi
+
+IP=$1
+
+OCF_TYPE=EC2PrivateIP
+OCF_RESKEY_lvs_support=0
+OCF_RESOURCE_INSTANCE=${OCF_TYPE}_$IP
+LEGAL_ACTIONS='(start|stop|status|monitor)'
+export OCF_TYPE OCF_RESOURCE_INSTANCE OCF_RESKEY_lvs_support
+
+
+case $2 in
+  status|monitor)	
+	ec2privateip_status
+	;;
+  start)
+	ec2privateip_start
+	;;
+  stop)
+	ec2privateip_stop
+	;;
+  *)
+	usage
+	exit $OCF_ERR_UNIMPLEMENTED
+	;;
+esac
+
+
